@@ -913,6 +913,16 @@ const clientInjectionScript = `
 export async function onRequest(context) {
     const { request } = context;
     const requestUrl = new URL(request.url);
+
+    if (requestUrl.pathname === "/success.html" || requestUrl.pathname === "/success.html/") {
+        return new Response("Success", {
+            status: 200,
+            headers: {
+                "Content-Type": "text/html"
+            }
+        });
+    }
+
     if (requestUrl.hostname === "translate.mill.ip-ddns.com") {
         const header = new Headers(request.headers)
         header.delete("host")
