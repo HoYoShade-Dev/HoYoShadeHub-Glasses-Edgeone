@@ -923,6 +923,10 @@ export async function onRequest(context) {
         });
     }
 
+    if (requestUrl.pathname.endsWith("/favicon.ico")) {
+        return Response.redirect("https://www.wto.org/favicon.ico", 302);
+    }
+
     if (requestUrl.hostname === "translate.mill.ip-ddns.com") {
         const header = new Headers(request.headers)
         header.delete("host")
