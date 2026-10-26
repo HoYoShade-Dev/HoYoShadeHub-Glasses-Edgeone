@@ -1,0 +1,129 @@
+# Keeps a fork in sync with its upstream repository.
+#
+# Disabled by default. To enable it in a fork, add the repository variable
+# UPSTREAM_SYNC_ENABLED = true (Settings > Secrets and variables > Actions > Variables).
+#
+# The fork branch is moved to the upstream commit itself (fast-forward), so no
+# merge commit or "sync" commit is ever created.
+#
+# Optional repository variables:
+#   UPSTREAM_REPO        owner/name of the upstream (default: the fork's parent)
+#   UPSTREAM_BRANCH      upstream branch to follow (default: upstream's default branch)
+#   UPSTREAM_SYNC_BRANCH fork branch to update (default: the fork's default branch)
+#   UPSTREAM_SYNC_FORCE  true = when the fork has diverged, reset it to upstream
+#                        (drops the fork's own commits on that branch)
+#
+# Optional repository secret:
+#   UPSTREAM_SYNC_TOKEN  PAT with Contents + Workflows write access. Required only
+#                        when upstream commits touch .github/workflows, because the
+#                        default GITHUB_TOKEN is not allowed to push workflow changes.
+
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: vars.UPSTREAM_SYNC_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve repositories and branches
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+          UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH }}
+          TARGET_BRANCH: ${{ vars.UPSTREAM_SYNC_BRANCH }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$UPSTREAM_REPO" ]; then
+            UPSTREAM_REPO=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')
+          fi
+          if [ -z "$UPSTREAM_REPO" ]; then
+            echo "::error::$GITHUB_REPOSITORY is not a fork. Set the UPSTREAM_REPO variable to owner/name."
+            exit 1
+          fi
+          if [ "$UPSTREAM_REPO" = "$GITHUB_REPOSITORY" ]; then
+            echo "::error::UPSTREAM_REPO points at this repository itself."
+            exit 1
+          fi
+
+          if [ -z "$UPSTREAM_BRANCH" ]; then
+            UPSTREAM_BRANCH=$(gh api "repos/$UPSTREAM_REPO" --jq '.default_branch')
+          fi
+          if [ -z "$TARGET_BRANCH" ]; then
+            TARGET_BRANCH=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
+          fi
+
+          echo "upstream_repo=$UPSTREAM_REPO" >> "$GITHUB_OUTPUT"
+          echo "upstream_branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Upstream: $UPSTREAM_REPO@$UPSTREAM_BRANCH -> $GITHUB_REPOSITORY@$TARGET_BRANCH"
+
+      - name: Check out fork
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.resolve.outputs.target_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Sync with upstream
+        env:
+          UPSTREAM_REPO: ${{ steps.resolve.outputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ steps.resolve.outputs.upstream_branch }}
+          TARGET_BRANCH: ${{ steps.resolve.outputs.target_branch }}
+          FORCE: ${{ vars.UPSTREAM_SYNC_FORCE }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags "https://github.com/$UPSTREAM_REPO.git" "$UPSTREAM_BRANCH"
+          local_sha=$(git rev-parse HEAD)
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          echo "Fork:     $local_sha"
+          echo "Upstream: $upstream_sha"
+
+          summary() { echo "$1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+
+          if [ "$local_sha" = "$upstream_sha" ]; then
+            summary "Already up to date with \`$UPSTREAM_REPO@$UPSTREAM_BRANCH\` (\`${upstream_sha:0:7}\`). Nothing to do."
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "$upstream_sha" "$local_sha"; then
+            summary "\`$TARGET_BRANCH\` already contains upstream \`${upstream_sha:0:7}\` plus its own commits. Nothing to do."
+            exit 0
+          fi
+
+          push() {
+            if ! git push "$@"; then
+              echo "::error::Push failed. If upstream changed files under .github/workflows, add an UPSTREAM_SYNC_TOKEN secret (PAT with Contents and Workflows write access)."
+              exit 1
+            fi
+          }
+
+          if git merge-base --is-ancestor "$local_sha" "$upstream_sha"; then
+            count=$(git rev-list --count "$local_sha..$upstream_sha")
+            push origin "$upstream_sha:refs/heads/$TARGET_BRANCH"
+            summary "Fast-forwarded \`$TARGET_BRANCH\` by $count upstream commit(s): \`${local_sha:0:7}\` -> \`${upstream_sha:0:7}\`."
+            exit 0
+          fi
+
+          if [ "$FORCE" = "true" ]; then
+            push --force-with-lease="refs/heads/$TARGET_BRANCH:$local_sha" origin "$upstream_sha:refs/heads/$TARGET_BRANCH"
+            summary "\`$TARGET_BRANCH\` had diverged; reset to upstream \`${upstream_sha:0:7}\` (was \`${local_sha:0:7}\`)."
+            exit 0
+          fi
+
+          echo "::error::\`$TARGET_BRANCH\` has diverged from upstream and cannot be fast-forwarded. Resolve it manually, or set UPSTREAM_SYNC_FORCE=true to reset the branch to upstream."
+          exit 1
